@@ -43,17 +43,20 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import com.sun.source.util.TreeScanner;
 import com.sun.source.util.Trees;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Consumer;
@@ -68,23 +71,25 @@ import javax.lang.model.element.VariableElement;
 import javax.lang.model.type.TypeMirror;
 
 /**
- * Main entry point.  Typical use is
+ * Main entry point. Typical use is
  * <code>SigTree.create(classpath, srcDir, otherSrcDir).hash("SHA-512",false)</code>.
  * <p>
- * Runs javac, and builds a tree of public and protected method signatures.
- * In "deep" mode, methods and constructors signatures will also incorporate a
- * drill-down through the code they contain, avoiding variable names but incorporating
- * the sequence of javac tree elements that occur within it, <i>and the closure
- * of any methods called which javac can find the source code to</i>.  Deep
- * mode is more useful when splitting out hashes by method, and can be used
- * to answer the question "has any code path that I call been changed since
- * the previous hash".
+ * Runs javac, and builds a tree of public and protected method signatures. In
+ * "deep" mode, methods and constructors signatures will also incorporate a
+ * drill-down through the code they contain, avoiding variable names but
+ * incorporating the sequence of javac tree elements that occur within it,
+ * <i>and the closure of any methods called which javac can find the source code
+ * to</i>. Deep mode is more useful when splitting out hashes by method, and can
+ * be used to answer the question "has any code path that I call been changed
+ * since the previous hash".
  * </p>
+ *
  * @author Tim Boudreau
  */
 public final class SigTree implements Signature, Iterable<ClassSignature> {
 
     private final Set<ClassSignature> children = new TreeSet<>();
+    private boolean useDirectHash = !Boolean.getBoolean("stringbuilder.hash");
 
     private SigTree() {
 
@@ -204,11 +209,37 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
         msig.enter(sigConsumer -> {
             assert pth.getCompilationUnit() != null : "Comp unit is null";
-            TV tv = new TV(task);
-            StringBuilder sig = new StringBuilder();
-            tv.scan(pth, sig);
+            String sig = this.useDirectHash ? runHashDrilldown(pth, task)
+                    : runStringBuilderDrilldown(pth, task);
             sigConsumer.accept(new CodeSig(sig));
         });
+    }
+
+    private String runStringBuilderDrilldown(TreePath pth, JavacTask task) {
+        TV tv = new TV(task);
+        StringBuilder sig = new StringBuilder(2048);
+        tv.scan(pth, new StringBuilderStringConsumer(sig));
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-512");
+            digest.update(sig.toString().getBytes(UTF_8));
+            return Base64.getUrlEncoder().encodeToString(digest.digest());
+        } catch (NoSuchAlgorithmException ex) {
+            // Would have been thrown early in startup if really unsupported
+            throw new AssertionError(ex);
+        }
+    }
+
+    private String runHashDrilldown(TreePath pth, JavacTask task) {
+        TV tv = new TV(task);
+        try {
+            HashingStringConsumer c = new HashingStringConsumer(MessageDigest.getInstance("SHA-512"));
+            tv.scan(pth, c);
+            return c.done();
+        } catch (NoSuchAlgorithmException ex) {
+            // Would have been thrown early in startup if really unsupported
+            throw new AssertionError(ex);
+        }
+
     }
 
     static TypeElement enclosingType(Element el) {
@@ -220,9 +251,9 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
 
     private static final class CodeSig implements Signature {
 
-        private final StringBuilder sb;
+        private final CharSequence sb;
 
-        public CodeSig(StringBuilder sb) {
+        public CodeSig(CharSequence sb) {
             this.sb = sb;
         }
 
@@ -236,8 +267,57 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
 
     }
 
+    interface StringConsumer {
+
+        StringConsumer append(CharSequence seq);
+
+        default StringConsumer append(char ch) {
+            return append(new String(new char[]{ch}));
+        }
+
+        default StringConsumer append(Object obj) {
+            return append(Objects.toString(obj));
+        }
+    }
+
+    private static final class HashingStringConsumer implements StringConsumer {
+
+        private final MessageDigest digest;
+
+        public HashingStringConsumer(MessageDigest digest) {
+            this.digest = digest;
+        }
+
+        @Override
+        public StringConsumer append(CharSequence seq) {
+            byte[] bytes = seq.toString().getBytes(UTF_8);
+            digest.update(bytes);
+            return this;
+        }
+
+        public String done() {
+            byte[] result = digest.digest();
+            return Base64.getUrlEncoder().encodeToString(result);
+        }
+    }
+
+    private static final class StringBuilderStringConsumer implements StringConsumer {
+
+        private final StringBuilder sb;
+
+        public StringBuilderStringConsumer(StringBuilder sb) {
+            this.sb = sb;
+        }
+
+        @Override
+        public StringConsumer append(CharSequence seq) {
+            sb.append(seq);
+            return this;
+        }
+    }
+
     // Scanner which is used to drill through source code
-    private static final class TV extends TreePathScanner<Void, StringBuilder> {
+    private static final class TV extends TreePathScanner<Void, StringConsumer> {
 
         private final JavacTask task;
         private final Map<String, String> subs;
@@ -246,7 +326,6 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         // be expensive in memory since it concatenates the closure of anything
         // called that the source can be found to.  It would be straightforward
         // to just add it to the hasher / messagedigest as we go.
-
         TV(JavacTask task, Map<String, String> subs) {
             this.subs = subs;
             this.task = task;
@@ -258,12 +337,12 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void scan(TreePath path, StringBuilder sb) {
+        public Void scan(TreePath path, StringConsumer sb) {
             return super.scan(path, sb);
         }
 
         @Override
-        public Void scan(Tree tree, StringBuilder p) {
+        public Void scan(Tree tree, StringConsumer p) {
             if (tree != null) {
                 switch (tree.getKind()) {
                     case MODIFIERS:
@@ -295,12 +374,12 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitReturn(ReturnTree node, StringBuilder p) {
+        public Void visitReturn(ReturnTree node, StringConsumer p) {
             return super.visitReturn(node, p);
         }
 
         @Override
-        public Void visitSynchronized(SynchronizedTree node, StringBuilder p) {
+        public Void visitSynchronized(SynchronizedTree node, StringConsumer p) {
             return super.visitSynchronized(node, p);
         }
 
@@ -315,7 +394,7 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitIdentifier(IdentifierTree node, StringBuilder p) {
+        public Void visitIdentifier(IdentifierTree node, StringConsumer p) {
             if (collecting) {
                 p.append(node.toString());
             }
@@ -323,7 +402,7 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitMemberReference(MemberReferenceTree node, StringBuilder p) {
+        public Void visitMemberReference(MemberReferenceTree node, StringConsumer p) {
             return collectIds(() -> {
                 p.append(node.getMode()).append(' ');
                 super.visitMemberReference(node, p);
@@ -331,26 +410,26 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitMemberSelect(MemberSelectTree node, StringBuilder p) {
+        public Void visitMemberSelect(MemberSelectTree node, StringConsumer p) {
             return collectIds(() -> {
                 super.visitMemberSelect(node, p);
             });
         }
 
         @Override
-        public Void visitInstanceOf(InstanceOfTree node, StringBuilder p) {
+        public Void visitInstanceOf(InstanceOfTree node, StringConsumer p) {
             p.append(node.getType()).append(' ');
             return super.visitInstanceOf(node, p);
         }
 
         @Override
-        public Void visitNewArray(NewArrayTree node, StringBuilder p) {
+        public Void visitNewArray(NewArrayTree node, StringConsumer p) {
             p.append(node.getType()).append(' ');
             return super.visitNewArray(node, p);
         }
 
         @Override
-        public Void visitNewClass(NewClassTree node, StringBuilder p) {
+        public Void visitNewClass(NewClassTree node, StringConsumer p) {
             p.append(node.getIdentifier()).append(' ');
             return super.visitNewClass(node, p);
         }
@@ -384,8 +463,9 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
             }
             TV tv = new TV(task, subs);
             subs.put(key, "<recurse-" + key + ">");
-            StringBuilder sb = new StringBuilder();
-            tv.scan(newPath, sb);
+            StringBuilder sb = new StringBuilder(256);
+            StringConsumer c = new StringBuilderStringConsumer(sb);
+            tv.scan(newPath, c);
             subs.put(key, result = sb.toString());
             return result;
         }
@@ -406,7 +486,7 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitMethodInvocation(MethodInvocationTree node, StringBuilder p) {
+        public Void visitMethodInvocation(MethodInvocationTree node, StringConsumer p) {
             // append the *last* name found, e.g. "foo" for an invocation of in x.bar.foo()
             p.append(new NameFinder().scan(node.getMethodSelect(), null));
             String sub = scanCurrentPathAsElement();
@@ -417,32 +497,32 @@ public final class SigTree implements Signature, Iterable<ClassSignature> {
         }
 
         @Override
-        public Void visitThrow(ThrowTree node, StringBuilder p) {
+        public Void visitThrow(ThrowTree node, StringConsumer p) {
             p.append(scanCurrentPathAsElement()).append(' ');
             return super.visitThrow(node, p);
         }
 
         @Override
-        public Void visitLiteral(LiteralTree node, StringBuilder p) {
+        public Void visitLiteral(LiteralTree node, StringConsumer p) {
             p.append(node.getValue()).append(' ');
             return super.visitLiteral(node, p);
         }
 
         @Override
-        public Void visitCompoundAssignment(CompoundAssignmentTree node, StringBuilder p) {
+        public Void visitCompoundAssignment(CompoundAssignmentTree node, StringConsumer p) {
             p.append(scanCurrentPathAsElement()).append(' ');
             return super.visitCompoundAssignment(node, p);
         }
 
         @Override
-        public Void visitVariable(VariableTree node, StringBuilder p) {
+        public Void visitVariable(VariableTree node, StringConsumer p) {
             Element el = Trees.instance(task).getElement(getCurrentPath());
             p.append(el.asType()).append(' ');
             return super.visitVariable(node, p);
         }
 
         @Override
-        public Void visitMethod(MethodTree node, StringBuilder p) {
+        public Void visitMethod(MethodTree node, StringConsumer p) {
             p.append(node.getName()).append(' ');
             return super.visitMethod(node, p);
         }
